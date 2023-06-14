@@ -43,6 +43,9 @@ compile_error!(
 #[macro_use]
 mod macros;
 
+#[cfg(feature = "reactor")]
+mod spin;
+
 mod descriptors;
 use crate::descriptors::{Descriptor, Descriptors, StreamType, Streams};
 
@@ -65,7 +68,7 @@ pub mod bindings {
     #[cfg(feature = "reactor")]
     wit_bindgen::generate!({
         path: "../wasi/wit",
-        world: "wasi:cli/imports",
+        world: "fermyon:spin/reactor",
         std_feature,
         raw_strings,
         // Automatically generated bindings for these functions will allocate
@@ -74,7 +77,30 @@ pub mod bindings {
         // can't support in these special core-wasm adapters.
         // Instead, we manually define the bindings for these functions in
         // terms of raw pointers.
-        skip: ["get-environment", "poll"],
+        skip: [
+            "get-environment",
+            "poll",
+            "http-types",
+            "send-request",
+            "handle-request",
+            "open",
+            "get",
+            "set",
+            "delete",
+            "exists",
+            "get-keys",
+            "close",
+            "publish",
+            "incr",
+            "del",
+            "sadd",
+            "smembers",
+            "srem",
+            "execute",
+            "get-config",
+            "query",
+            "handle-message"
+        ],
     });
 
     #[cfg(feature = "proxy")]
@@ -233,6 +259,7 @@ pub struct ImportAlloc {
     len: Cell<usize>,
     // When not-empty, allocator should use this arena to satisfy allocations.
     arena: Cell<Option<&'static BumpArena>>,
+    use_main: Cell<bool>,
 }
 
 impl ImportAlloc {
@@ -241,6 +268,7 @@ impl ImportAlloc {
             buffer: Cell::new(std::ptr::null_mut()),
             len: Cell::new(0),
             arena: Cell::new(None),
+            use_main: Cell::new(false),
         }
     }
 
@@ -248,6 +276,9 @@ impl ImportAlloc {
     /// Use the provided buffer to satisfy that import allocation. The user is responsible
     /// for making sure allocated imports are not used beyond the lifetime of the buffer.
     fn with_buffer<T>(&self, buffer: *mut u8, len: usize, f: impl FnOnce() -> T) -> T {
+        if self.use_main.get() {
+            unreachable!("main mode");
+        }
         if self.arena.get().is_some() {
             unreachable!("arena mode")
         }
@@ -265,6 +296,9 @@ impl ImportAlloc {
     /// Use the provided BumpArena to satisfry those allocations. The user is responsible
     /// for making sure allocated imports are not used beyond the lifetime of the arena.
     fn with_arena<T>(&self, arena: &BumpArena, f: impl FnOnce() -> T) -> T {
+        if self.use_main.get() {
+            unreachable!("main mode");
+        }
         if !self.buffer.get().is_null() {
             unreachable!("buffer mode")
         }
@@ -280,9 +314,25 @@ impl ImportAlloc {
         r
     }
 
+    fn with_main<T>(&self, f: impl FnOnce() -> T) -> T {
+        if !self.buffer.get().is_null() {
+            unreachable!("buffer mode")
+        }
+        if self.arena.get().is_some() {
+            unreachable!("arena mode")
+        }
+        let prev = self.use_main.get();
+        self.use_main.set(true);
+        let r = f();
+        self.use_main.set(prev);
+        r
+    }
+
     /// To be used by cabi_import_realloc only!
     fn alloc(&self, align: usize, size: usize) -> *mut u8 {
-        if let Some(arena) = self.arena.get() {
+        if self.use_main.get() {
+            unsafe { cabi_export_realloc(ptr::null_mut(), 0, align, size) }
+        } else if let Some(arena) = self.arena.get() {
             arena.alloc(align, size)
         } else {
             let buffer = self.buffer.get();
@@ -309,6 +359,7 @@ impl ImportAlloc {
 /// arguments/env/etc coming into a component is bounded by the current 64k
 /// (ish) limit. That's just an implementation limit though which can be lifted
 /// by dynamically calling the main module's allocator as necessary for more data.
+#[cfg(feature = "command")]
 #[no_mangle]
 pub unsafe extern "C" fn cabi_export_realloc(
     old_ptr: *mut u8,
@@ -322,6 +373,25 @@ pub unsafe extern "C" fn cabi_export_realloc(
     let mut ret = null_mut::<u8>();
     State::with(|state| {
         ret = state.long_lived_arena.alloc(align, new_size);
+        Ok(())
+    });
+    ret
+}
+
+#[cfg(feature = "reactor")]
+#[no_mangle]
+pub unsafe extern "C" fn cabi_export_realloc(
+    old_ptr: *mut u8,
+    old_size: usize,
+    align: usize,
+    new_size: usize,
+) -> *mut u8 {
+    let mut ret = ptr::null_mut();
+    State::with(|state| {
+        let prev = state.may_reenter.get();
+        state.may_reenter.set(false);
+        ret = spin::canonical_abi_realloc(old_ptr, old_size, align, new_size);
+        state.may_reenter.set(prev);
         Ok(())
     });
     ret
@@ -405,16 +475,29 @@ pub unsafe extern "C" fn environ_get(environ: *mut *mut u8, environ_buf: *mut u8
     })
 }
 
+fn may_reenter() -> bool {
+    if matches!(
+        unsafe { get_allocation_state() },
+        AllocationState::StackAllocated | AllocationState::StateAllocated
+    ) {
+        let mut ret = false;
+        State::with(|state| {
+            ret = state.may_reenter.get();
+            Ok(())
+        });
+        ret
+    } else {
+        false
+    }
+}
+
 /// Return environment variable data sizes.
 #[no_mangle]
 pub unsafe extern "C" fn environ_sizes_get(
     environc: *mut Size,
     environ_buf_size: *mut Size,
 ) -> Errno {
-    if !matches!(
-        get_allocation_state(),
-        AllocationState::StackAllocated | AllocationState::StateAllocated
-    ) {
+    if !may_reenter() {
         *environc = 0;
         *environ_buf_size = 0;
         return ERRNO_SUCCESS;
@@ -901,10 +984,7 @@ pub unsafe extern "C" fn fd_pread(
 /// Return a description of the given preopened file descriptor.
 #[no_mangle]
 pub unsafe extern "C" fn fd_prestat_get(fd: Fd, buf: *mut Prestat) -> Errno {
-    if !matches!(
-        get_allocation_state(),
-        AllocationState::StackAllocated | AllocationState::StateAllocated
-    ) {
+    if !may_reenter() {
         return ERRNO_BADF;
     }
 
@@ -1418,10 +1498,7 @@ pub unsafe extern "C" fn fd_write(
     mut iovs_len: usize,
     nwritten: *mut Size,
 ) -> Errno {
-    if !matches!(
-        get_allocation_state(),
-        AllocationState::StackAllocated | AllocationState::StateAllocated
-    ) {
+    if !may_reenter() {
         *nwritten = 0;
         return ERRNO_IO;
     }
@@ -2099,10 +2176,7 @@ pub unsafe extern "C" fn sched_yield() -> Errno {
 /// number generator, rather than to provide the random data directly.
 #[no_mangle]
 pub unsafe extern "C" fn random_get(buf: *mut u8, buf_len: Size) -> Errno {
-    if matches!(
-        get_allocation_state(),
-        AllocationState::StackAllocated | AllocationState::StateAllocated
-    ) {
+    if may_reenter() {
         State::with(|state| {
             assert_eq!(buf_len as u32 as Size, buf_len);
             let result = state
@@ -2458,6 +2532,8 @@ struct State {
     #[cfg(not(feature = "proxy"))]
     dotdot: [UnsafeCell<u8>; 2],
 
+    may_reenter: Cell<bool>,
+
     /// Another canary constant located at the end of the structure to catch
     /// memory corruption coming from the bottom.
     magic2: u32,
@@ -2520,7 +2596,7 @@ const fn bump_arena_size() -> usize {
     }
 
     // Remove miscellaneous metadata also stored in state.
-    let misc = if cfg!(feature = "proxy") { 7 } else { 14 };
+    let misc = if cfg!(feature = "proxy") { 7 } else { 16 };
     start -= misc * size_of::<usize>();
 
     // Everything else is the `command_data` allocation.
@@ -2551,6 +2627,21 @@ extern "C" {
     fn set_state_ptr(state: *mut State);
     fn get_allocation_state() -> AllocationState;
     fn set_allocation_state(state: AllocationState);
+}
+
+#[cfg(feature = "reactor")]
+unsafe fn realloc(old_ptr: *mut u8, old_len: usize, align: usize, new_len: usize) -> *mut u8 {
+    spin::canonical_abi_realloc(old_ptr, old_len, align, new_len)
+}
+
+#[cfg(feature = "command")]
+unsafe fn realloc(old_ptr: *mut u8, old_len: usize, align: usize, new_len: usize) -> *mut u8 {
+    #[link(wasm_import_module = "__main_module__")]
+    extern "C" {
+        fn cabi_realloc(old_ptr: *mut u8, old_len: usize, align: usize, new_len: usize) -> *mut u8;
+    }
+
+    cabi_realloc(old_ptr, old_len, align, new_len)
 }
 
 impl State {
@@ -2596,7 +2687,7 @@ impl State {
         unsafe { set_allocation_state(AllocationState::StateAllocating) };
 
         let ret = unsafe {
-            cabi_realloc(
+            realloc(
                 ptr::null_mut(),
                 0,
                 mem::align_of::<UnsafeCell<State>>(),
@@ -2642,6 +2733,7 @@ impl State {
             },
             #[cfg(not(feature = "proxy"))]
             dotdot: [UnsafeCell::new(b'.'), UnsafeCell::new(b'.')],
+            may_reenter: Cell::new(true),
         });
     }
 
