@@ -39,6 +39,6 @@ pub use cap_rand::RngCore;
 pub use clocks::{WasiClocks, WasiMonotonicClock, WasiWallClock};
 pub use ctx::{WasiCtx, WasiCtxBuilder, WasiView};
 pub use error::I32Exit;
-pub use filesystem::{DirPerms, FilePerms};
+pub use filesystem::{Dir, DirPerms, FilePerms};
 pub use stream::{InputStream, OutputStream};
 pub use table::{Table, TableError};
