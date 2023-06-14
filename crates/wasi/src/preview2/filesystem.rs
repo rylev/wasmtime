@@ -69,7 +69,7 @@ bitflags::bitflags! {
     }
 }
 
-pub(crate) struct Dir {
+pub struct Dir {
     pub dir: cap_std::fs::Dir,
     pub perms: DirPerms,
     pub file_perms: FilePerms,
