@@ -2,7 +2,7 @@ package fermyon:spin
 
 // All of the same imports available in the wasi:cli/command world, but no
 // export required:
-world preview1-adapter-reactor {
+world reactor {
   import wasi:clocks/wall-clock@0.2.0-rc-2023-10-18;
   import wasi:clocks/monotonic-clock@0.2.0-rc-2023-10-18;
   import wasi:clocks/timezone@0.2.0-rc-2023-10-18;
@@ -38,6 +38,7 @@ world preview1-adapter-reactor {
   import redis
   import key-value
   import http
+  import llm
 
   export inbound-http
   export inbound-redis
