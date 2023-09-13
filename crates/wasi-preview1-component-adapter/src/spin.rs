@@ -31,51 +31,6 @@ macro_rules! wrap_export {
     }
 }
 
-macro_rules! wrap_import_llm_infer {
-    ($export_name:literal $name:ident $import_module:literal $import_name:literal) => {
-        #[export_name = $export_name]
-        unsafe extern "C" fn $name(
-            a0: i32,
-            a1: i32,
-            a2: i32,
-            a3: i32,
-            a4: i32,
-            a5: i32,
-            a6: f32,
-            a7: i32,
-            a8: f32,
-            a9: i32,
-            a10: f32,
-            a11: i32,
-        ) {
-            #[link(wasm_import_module = $import_module)]
-            extern "C" {
-                #[cfg_attr(target_arch = "wasm32", link_name = $import_name)]
-                fn wit_import(
-                    a0: i32,
-                    a1: i32,
-                    a2: i32,
-                    a3: i32,
-                    a4: i32,
-                    a5: i32,
-                    a6: f32,
-                    a7: i32,
-                    a8: f32,
-                    a9: i32,
-                    a10: f32,
-                    a11: i32,
-                );
-            }
-            super::State::with(|state| {
-                state
-                    .import_alloc
-                    .with_main(|| wit_import(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11));
-                Ok(())
-            });
-        }
-    };
-}
-
 wrap_export!("fermyon:spin/inbound-redis#handle-message" inbound_redis_handle_message "handle-redis-message"
              a0 a1);
 

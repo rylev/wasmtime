@@ -28,7 +28,7 @@ mod macros;
 mod spin;
 
 mod descriptors;
-use crate::descriptors::{Descriptor, Descriptors, IsATTY, StreamType, Streams};
+use crate::descriptors::{Descriptor, Descriptors, StreamType, Streams};
 
 pub mod bindings {
     #[cfg(feature = "command")]
