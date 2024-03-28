@@ -1,90 +1,111 @@
-use crate::host::network::util;
-use crate::network::SocketAddrUse;
-use crate::runtime::with_ambient_tokio_runtime;
-use crate::tcp::{TcpReadStream, TcpSocket, TcpState, TcpWriteStream};
-use crate::{
-    bindings::{
-        io::streams::{InputStream, OutputStream},
-        sockets::network::{ErrorCode, IpAddressFamily, IpSocketAddress, Network},
-        sockets::tcp::{self, ShutdownType},
-    },
-    network::SocketAddressFamily,
+use crate::bindings::sockets::tcp_create_socket;
+use crate::bindings::{
+    io::streams::{InputStream, OutputStream},
+    sockets::network::{ErrorCode, IpAddressFamily, IpSocketAddress, Network},
+    sockets::tcp::{self, ShutdownType},
 };
-use crate::{Pollable, SocketResult, WasiView};
-use io_lifetimes::AsSocketlike;
-use rustix::io::Errno;
-use rustix::net::sockopt;
+use crate::pipe::AsyncReadStream;
+use crate::tcp::{SystemTcpSocket, TcpReader, TcpWriter};
+use crate::write_stream::AsyncWriteStream;
+use crate::{Pollable, Preview2Future, SocketAddrUse, SocketResult, Subscribe, WasiView};
+use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::task::Poll;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use wasmtime::component::Resource;
 
+/// The state of the TCP socket wrapper.
+///
+/// This represents the various states a socket can be in during the
+/// activities of binding, listening, accepting, and connecting.
+enum TcpState {
+    /// The initial state for a newly-created socket.
+    Default,
+
+    /// Binding started via `start_bind`.
+    BindStarted,
+
+    /// Binding finished via `finish_bind`. The socket has an address but
+    /// is not yet listening for connections.
+    Bound,
+
+    /// Listening started via `listen_start`.
+    ListenStarted,
+
+    /// The socket is now listening and waiting for an incoming connection.
+    Listening {
+        pending_result: Option<io::Result<(SystemTcpSocket, TcpReader, TcpWriter)>>,
+    },
+
+    /// An outgoing connection is started via `start_connect`.
+    Connecting {
+        future: Preview2Future<io::Result<(TcpReader, TcpWriter)>>,
+    },
+
+    /// An outgoing connection has been established.
+    Connected,
+}
+
+/// A `wasi:sockets/tcp::tcp-socket` instance.
+/// This is mostly glue code translating between WASI types and concepts (Tables,
+/// Resources, Pollables, ...) to their idiomatic Rust equivalents.
+pub struct TcpSocketResource {
+    inner: SystemTcpSocket,
+    tcp_state: TcpState,
+}
+
+impl TcpSocketResource {
+    fn new_input_stream(reader: TcpReader) -> InputStream {
+        InputStream::Host(Box::new(AsyncReadStream::new(reader)))
+    }
+
+    fn new_output_stream(writer: TcpWriter) -> OutputStream {
+        const SOCKET_READY_SIZE: usize = 1024 * 1024 * 1024;
+
+        Box::new(AsyncWriteStream::new(SOCKET_READY_SIZE, writer))
+    }
+}
+
 impl<T: WasiView> tcp::Host for T {}
+
+impl<T: WasiView> tcp_create_socket::Host for T {
+    fn create_tcp_socket(
+        &mut self,
+        address_family: IpAddressFamily,
+    ) -> SocketResult<Resource<TcpSocketResource>> {
+        let socket = SystemTcpSocket::new(address_family.into())?;
+        let wrapper = TcpSocketResource {
+            inner: socket,
+            tcp_state: TcpState::Default,
+        };
+        let socket = self.table().push(wrapper)?;
+        Ok(socket)
+    }
+}
 
 impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
     fn start_bind(
         &mut self,
-        this: Resource<tcp::TcpSocket>,
+        this: Resource<TcpSocketResource>,
         network: Resource<Network>,
         local_address: IpSocketAddress,
     ) -> SocketResult<()> {
         self.ctx().allowed_network_uses.check_allowed_tcp()?;
         let table = self.table();
-        let socket = table.get(&this)?;
-        let network = table.get(&network)?;
+        table
+            .get(&network)?
+            .check_socket_addr(&local_address.into(), SocketAddrUse::TcpBind)?;
+        let socket = table.get_mut(&this)?;
         let local_address: SocketAddr = local_address.into();
 
-        let tokio_socket = match &socket.tcp_state {
-            TcpState::Default(socket) => socket,
-            TcpState::BindStarted(..) => return Err(ErrorCode::ConcurrencyConflict.into()),
+        match socket.tcp_state {
+            TcpState::Default => {}
+            TcpState::BindStarted => return Err(ErrorCode::ConcurrencyConflict.into()),
             _ => return Err(ErrorCode::InvalidState.into()),
-        };
-
-        util::validate_unicast(&local_address)?;
-        util::validate_address_family(&local_address, &socket.family)?;
-
-        {
-            // Ensure that we're allowed to connect to this address.
-            network.check_socket_addr(&local_address, SocketAddrUse::TcpBind)?;
-
-            // Automatically bypass the TIME_WAIT state when the user is trying
-            // to bind to a specific port:
-            let reuse_addr = local_address.port() > 0;
-
-            // Unconditionally (re)set SO_REUSEADDR, even when the value is false.
-            // This ensures we're not accidentally affected by any socket option
-            // state left behind by a previous failed call to this method (start_bind).
-            util::set_tcp_reuseaddr(&tokio_socket, reuse_addr)?;
-
-            // Perform the OS bind call.
-            tokio_socket.bind(local_address).map_err(|error| {
-                match Errno::from_io_error(&error) {
-                    // From https://pubs.opengroup.org/onlinepubs/9699919799/functions/bind.html:
-                    // > [EAFNOSUPPORT] The specified address is not a valid address for the address family of the specified socket
-                    //
-                    // The most common reasons for this error should have already
-                    // been handled by our own validation slightly higher up in this
-                    // function. This error mapping is here just in case there is
-                    // an edge case we didn't catch.
-                    Some(Errno::AFNOSUPPORT) => ErrorCode::InvalidArgument,
-
-                    // See: https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-bind#:~:text=WSAENOBUFS
-                    // Windows returns WSAENOBUFS when the ephemeral ports have been exhausted.
-                    #[cfg(windows)]
-                    Some(Errno::NOBUFS) => ErrorCode::AddressInUse,
-
-                    _ => ErrorCode::from(error),
-                }
-            })?;
         }
 
-        let socket = table.get_mut(&this)?;
-
-        socket.tcp_state = match std::mem::replace(&mut socket.tcp_state, TcpState::Closed) {
-            TcpState::Default(socket) => TcpState::BindStarted(socket),
-            _ => unreachable!(),
-        };
+        socket.inner.bind(local_address)?;
+        socket.tcp_state = TcpState::BindStarted;
 
         Ok(())
     }
@@ -94,15 +115,10 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
         let socket = table.get_mut(&this)?;
 
         match socket.tcp_state {
-            TcpState::BindStarted(..) => {}
+            TcpState::BindStarted => {}
             _ => return Err(ErrorCode::NotInProgress.into()),
         }
-
-        socket.tcp_state = match std::mem::replace(&mut socket.tcp_state, TcpState::Closed) {
-            TcpState::BindStarted(socket) => TcpState::Bound(socket),
-            _ => unreachable!(),
-        };
-
+        socket.tcp_state = TcpState::Bound;
         Ok(())
     }
 
@@ -114,38 +130,28 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
     ) -> SocketResult<()> {
         self.ctx().allowed_network_uses.check_allowed_tcp()?;
         let table = self.table();
-        let socket = table.get(&this)?;
-        let network = table.get(&network)?;
         let remote_address: SocketAddr = remote_address.into();
+        table
+            .get(&network)?
+            .check_socket_addr(&remote_address, SocketAddrUse::TcpConnect)?;
+        let socket = table.get_mut(&this)?;
 
         match socket.tcp_state {
-            TcpState::Default(..) => {}
-
-            TcpState::Connecting(..) | TcpState::ConnectReady(..) => {
-                return Err(ErrorCode::ConcurrencyConflict.into())
-            }
-
+            TcpState::Default => {}
+            TcpState::Connecting { .. } => return Err(ErrorCode::ConcurrencyConflict.into()),
             _ => return Err(ErrorCode::InvalidState.into()),
+        }
+
+        let mut future = Preview2Future::new(socket.inner.connect(remote_address));
+
+        // Attempt to return (validation) errors immediately:
+        let future = match future.try_resolve() {
+            Some(Err(e)) => return Err(e.into()),
+            Some(Ok(r)) => Preview2Future::done(Ok(r)),
+            None => future,
         };
 
-        util::validate_unicast(&remote_address)?;
-        util::validate_remote_address(&remote_address)?;
-        util::validate_address_family(&remote_address, &socket.family)?;
-
-        // Ensure that we're allowed to connect to this address.
-        network.check_socket_addr(&remote_address, SocketAddrUse::TcpConnect)?;
-
-        let socket = table.get_mut(&this)?;
-        let TcpState::Default(tokio_socket) =
-            std::mem::replace(&mut socket.tcp_state, TcpState::Closed)
-        else {
-            unreachable!();
-        };
-
-        let future = tokio_socket.connect(remote_address);
-
-        socket.tcp_state = TcpState::Connecting(Box::pin(future));
-
+        socket.tcp_state = TcpState::Connecting { future };
         Ok(())
     }
 
@@ -156,108 +162,64 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
         let table = self.table();
         let socket = table.get_mut(&this)?;
 
-        let previous_state = std::mem::replace(&mut socket.tcp_state, TcpState::Closed);
-        let result = match previous_state {
-            TcpState::ConnectReady(result) => result,
-            TcpState::Connecting(mut future) => {
-                let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-                match with_ambient_tokio_runtime(|| future.as_mut().poll(&mut cx)) {
-                    Poll::Ready(result) => result,
-                    Poll::Pending => {
-                        socket.tcp_state = TcpState::Connecting(future);
-                        return Err(ErrorCode::WouldBlock.into());
-                    }
-                }
-            }
-            previous_state => {
-                socket.tcp_state = previous_state;
-                return Err(ErrorCode::NotInProgress.into());
-            }
+        let TcpState::Connecting { future } = &mut socket.tcp_state else {
+            return Err(ErrorCode::NotInProgress.into());
         };
 
-        match result {
-            Ok(stream) => {
-                let stream = Arc::new(stream);
+        match future.try_resolve() {
+            Some(Ok((reader, writer))) => {
+                socket.tcp_state = TcpState::Connected;
 
-                let input: InputStream =
-                    InputStream::Host(Box::new(TcpReadStream::new(stream.clone())));
-                let output: OutputStream = Box::new(TcpWriteStream::new(stream.clone()));
+                let input = TcpSocketResource::new_input_stream(reader);
+                let output = TcpSocketResource::new_output_stream(writer);
 
                 let input_stream = self.table().push_child(input, &this)?;
                 let output_stream = self.table().push_child(output, &this)?;
 
-                let socket = self.table().get_mut(&this)?;
-                socket.tcp_state = TcpState::Connected(stream);
                 Ok((input_stream, output_stream))
             }
-            Err(err) => {
-                socket.tcp_state = TcpState::Closed;
-                Err(err.into())
+            Some(Err(e)) => {
+                socket.tcp_state = TcpState::Default;
+                Err(e.into())
             }
+            None => Err(ErrorCode::WouldBlock.into()),
         }
     }
 
     fn start_listen(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<()> {
-        self.ctx().allowed_network_uses.check_allowed_tcp()?;
         let table = self.table();
         let socket = table.get_mut(&this)?;
 
-        match std::mem::replace(&mut socket.tcp_state, TcpState::Closed) {
-            TcpState::Bound(tokio_socket) => {
-                socket.tcp_state = TcpState::ListenStarted(tokio_socket);
-                Ok(())
+        match socket.tcp_state {
+            TcpState::Bound => {}
+            TcpState::Default | TcpState::Connected | TcpState::Listening { .. } => {
+                return Err(ErrorCode::InvalidState.into())
             }
-            TcpState::ListenStarted(tokio_socket) => {
-                socket.tcp_state = TcpState::ListenStarted(tokio_socket);
-                Err(ErrorCode::ConcurrencyConflict.into())
-            }
-            previous_state => {
-                socket.tcp_state = previous_state;
-                Err(ErrorCode::InvalidState.into())
+            TcpState::ListenStarted | TcpState::Connecting { .. } | TcpState::BindStarted => {
+                return Err(ErrorCode::ConcurrencyConflict.into())
             }
         }
+
+        socket.inner.listen()?;
+        socket.tcp_state = TcpState::ListenStarted;
+
+        Ok(())
     }
 
     fn finish_listen(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<()> {
         let table = self.table();
         let socket = table.get_mut(&this)?;
 
-        let tokio_socket = match std::mem::replace(&mut socket.tcp_state, TcpState::Closed) {
-            TcpState::ListenStarted(tokio_socket) => tokio_socket,
-            previous_state => {
-                socket.tcp_state = previous_state;
-                return Err(ErrorCode::NotInProgress.into());
-            }
+        match socket.tcp_state {
+            TcpState::ListenStarted => {}
+            _ => return Err(ErrorCode::NotInProgress.into()),
+        }
+
+        socket.tcp_state = TcpState::Listening {
+            pending_result: None,
         };
 
-        match with_ambient_tokio_runtime(|| tokio_socket.listen(socket.listen_backlog_size)) {
-            Ok(listener) => {
-                socket.tcp_state = TcpState::Listening {
-                    listener,
-                    pending_accept: None,
-                };
-                Ok(())
-            }
-            Err(err) => {
-                socket.tcp_state = TcpState::Closed;
-
-                Err(match Errno::from_io_error(&err) {
-                    // See: https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-listen#:~:text=WSAEMFILE
-                    // According to the docs, `listen` can return EMFILE on Windows.
-                    // This is odd, because we're not trying to create a new socket
-                    // or file descriptor of any kind. So we rewrite it to less
-                    // surprising error code.
-                    //
-                    // At the time of writing, this behavior has never been experimentally
-                    // observed by any of the wasmtime authors, so we're relying fully
-                    // on Microsoft's documentation here.
-                    #[cfg(windows)]
-                    Some(Errno::MFILE) => Errno::NOBUFS.into(),
-
-                    _ => err.into(),
-                })
-            }
-        }
+        Ok(())
     }
 
     fn accept(
@@ -268,94 +230,33 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
         Resource<InputStream>,
         Resource<OutputStream>,
     )> {
-        self.ctx().allowed_network_uses.check_allowed_tcp()?;
         let table = self.table();
         let socket = table.get_mut(&this)?;
 
-        let TcpState::Listening {
-            listener,
-            pending_accept,
-        } = &mut socket.tcp_state
-        else {
+        let TcpState::Listening { pending_result } = &mut socket.tcp_state else {
             return Err(ErrorCode::InvalidState.into());
         };
 
-        let result = match pending_accept.take() {
-            Some(result) => result,
+        let (client, reader, writer) = match pending_result.take() {
+            Some(Ok(client)) => client,
+            Some(Err(e)) => return Err(e.into()),
             None => {
-                let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-                match with_ambient_tokio_runtime(|| listener.poll_accept(&mut cx))
-                    .map_ok(|(stream, _)| stream)
-                {
-                    Poll::Ready(result) => result,
-                    Poll::Pending => Err(Errno::WOULDBLOCK.into()),
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                match socket.inner.poll_accept(&mut cx) {
+                    Poll::Ready(Ok(client)) => client,
+                    Poll::Ready(Err(e)) => return Err(e.into()),
+                    Poll::Pending => return Err(ErrorCode::WouldBlock.into()),
                 }
             }
         };
 
-        let client = result.map_err(|err| match Errno::from_io_error(&err) {
-            // From: https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-accept#:~:text=WSAEINPROGRESS
-            // > WSAEINPROGRESS: A blocking Windows Sockets 1.1 call is in progress,
-            // > or the service provider is still processing a callback function.
-            //
-            // wasi-sockets doesn't have an equivalent to the EINPROGRESS error,
-            // because in POSIX this error is only returned by a non-blocking
-            // `connect` and wasi-sockets has a different solution for that.
-            #[cfg(windows)]
-            Some(Errno::INPROGRESS) => Errno::INTR.into(),
+        let tcp_socket = TcpSocketResource {
+            inner: client,
+            tcp_state: TcpState::Connected,
+        };
 
-            // Normalize Linux' non-standard behavior.
-            //
-            // From https://man7.org/linux/man-pages/man2/accept.2.html:
-            // > Linux accept() passes already-pending network errors on the
-            // > new socket as an error code from accept(). This behavior
-            // > differs from other BSD socket implementations. (...)
-            #[cfg(target_os = "linux")]
-            Some(
-                Errno::CONNRESET
-                | Errno::NETRESET
-                | Errno::HOSTUNREACH
-                | Errno::HOSTDOWN
-                | Errno::NETDOWN
-                | Errno::NETUNREACH
-                | Errno::PROTO
-                | Errno::NOPROTOOPT
-                | Errno::NONET
-                | Errno::OPNOTSUPP,
-            ) => Errno::CONNABORTED.into(),
-
-            _ => err,
-        })?;
-
-        #[cfg(target_os = "macos")]
-        {
-            // Manually inherit socket options from listener. We only have to
-            // do this on platforms that don't already do this automatically
-            // and only if a specific value was explicitly set on the listener.
-
-            if let Some(size) = socket.receive_buffer_size {
-                _ = util::set_socket_recv_buffer_size(&client, size); // Ignore potential error.
-            }
-
-            if let Some(size) = socket.send_buffer_size {
-                _ = util::set_socket_send_buffer_size(&client, size); // Ignore potential error.
-            }
-
-            // For some reason, IP_TTL is inherited, but IPV6_UNICAST_HOPS isn't.
-            if let (SocketAddressFamily::Ipv6, Some(ttl)) = (socket.family, socket.hop_limit) {
-                _ = util::set_ipv6_unicast_hops(&client, ttl); // Ignore potential error.
-            }
-
-            if let Some(value) = socket.keep_alive_idle_time {
-                _ = util::set_tcp_keepidle(&client, value); // Ignore potential error.
-            }
-        }
-
-        let client = Arc::new(client);
-
-        let input: InputStream = InputStream::Host(Box::new(TcpReadStream::new(client.clone())));
-        let output: OutputStream = Box::new(TcpWriteStream::new(client.clone()));
-        let tcp_socket = TcpSocket::from_state(TcpState::Connected(client), socket.family)?;
+        let input = TcpSocketResource::new_input_stream(reader);
+        let output = TcpSocketResource::new_output_stream(writer);
 
         let tcp_socket = self.table().push(tcp_socket)?;
         let input_stream = self.table().push_child(input, &tcp_socket)?;
@@ -368,28 +269,26 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
         let table = self.table();
         let socket = table.get(&this)?;
 
-        let view = match socket.tcp_state {
-            TcpState::Default(..) => return Err(ErrorCode::InvalidState.into()),
-            TcpState::BindStarted(..) => return Err(ErrorCode::ConcurrencyConflict.into()),
-            _ => socket.as_std_view()?,
-        };
+        match socket.tcp_state {
+            TcpState::Default => return Err(ErrorCode::InvalidState.into()),
+            TcpState::BindStarted => return Err(ErrorCode::ConcurrencyConflict.into()),
+            _ => {}
+        }
 
-        Ok(view.local_addr()?.into())
+        Ok(socket.inner.local_address()?.into())
     }
 
     fn remote_address(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<IpSocketAddress> {
         let table = self.table();
         let socket = table.get(&this)?;
 
-        let view = match socket.tcp_state {
-            TcpState::Connected(..) => socket.as_std_view()?,
-            TcpState::Connecting(..) | TcpState::ConnectReady(..) => {
-                return Err(ErrorCode::ConcurrencyConflict.into())
-            }
+        match socket.tcp_state {
+            TcpState::Connected => {}
+            TcpState::Connecting { .. } => return Err(ErrorCode::ConcurrencyConflict.into()),
             _ => return Err(ErrorCode::InvalidState.into()),
-        };
+        }
 
-        Ok(view.peer_addr()?.into())
+        Ok(socket.inner.remote_address()?.into())
     }
 
     fn is_listening(&mut self, this: Resource<tcp::TcpSocket>) -> Result<bool, anyhow::Error> {
@@ -408,11 +307,7 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
     ) -> Result<IpAddressFamily, anyhow::Error> {
         let table = self.table();
         let socket = table.get(&this)?;
-
-        match socket.family {
-            SocketAddressFamily::Ipv4 => Ok(IpAddressFamily::Ipv4),
-            SocketAddressFamily::Ipv6 => Ok(IpAddressFamily::Ipv6),
-        }
+        Ok(socket.inner.address_family().into())
     }
 
     fn set_listen_backlog_size(
@@ -420,49 +315,16 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
         this: Resource<tcp::TcpSocket>,
         value: u64,
     ) -> SocketResult<()> {
-        const MIN_BACKLOG: u32 = 1;
-        const MAX_BACKLOG: u32 = i32::MAX as u32; // OS'es will most likely limit it down even further.
-
         let table = self.table();
         let socket = table.get_mut(&this)?;
-
-        if value == 0 {
-            return Err(ErrorCode::InvalidArgument.into());
-        }
-
-        // Silently clamp backlog size. This is OK for us to do, because operating systems do this too.
-        let value = value
-            .try_into()
-            .unwrap_or(u32::MAX)
-            .clamp(MIN_BACKLOG, MAX_BACKLOG);
-
-        match &socket.tcp_state {
-            TcpState::Default(..) | TcpState::Bound(..) => {
-                // Socket not listening yet. Stash value for first invocation to `listen`.
-                socket.listen_backlog_size = value;
-
-                Ok(())
-            }
-            TcpState::Listening { listener, .. } => {
-                // Try to update the backlog by calling `listen` again.
-                // Not all platforms support this. We'll only update our own value if the OS supports changing the backlog size after the fact.
-
-                rustix::net::listen(&listener, value.try_into().unwrap())
-                    .map_err(|_| ErrorCode::NotSupported)?;
-
-                socket.listen_backlog_size = value;
-
-                Ok(())
-            }
-            _ => Err(ErrorCode::InvalidState.into()),
-        }
+        let value = value.try_into().unwrap_or(usize::MAX);
+        Ok(socket.inner.set_listen_backlog_size(value)?)
     }
 
     fn keep_alive_enabled(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<bool> {
         let table = self.table();
         let socket = table.get(&this)?;
-        let view = &*socket.as_std_view()?;
-        Ok(sockopt::get_socket_keepalive(view)?)
+        Ok(socket.inner.keep_alive_enabled()?)
     }
 
     fn set_keep_alive_enabled(
@@ -471,16 +333,15 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
         value: bool,
     ) -> SocketResult<()> {
         let table = self.table();
-        let socket = table.get(&this)?;
-        let view = &*socket.as_std_view()?;
-        Ok(sockopt::set_socket_keepalive(view, value)?)
+        let socket = table.get_mut(&this)?;
+        Ok(socket.inner.set_keep_alive_enabled(value)?)
     }
 
     fn keep_alive_idle_time(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<u64> {
         let table = self.table();
         let socket = table.get(&this)?;
-        let view = &*socket.as_std_view()?;
-        Ok(sockopt::get_tcp_keepidle(view)?.as_nanos() as u64)
+        let duration = socket.inner.keep_alive_idle_time()?;
+        Ok(duration.as_nanos() as u64)
     }
 
     fn set_keep_alive_idle_time(
@@ -491,25 +352,14 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
         let table = self.table();
         let socket = table.get_mut(&this)?;
         let duration = Duration::from_nanos(value);
-        {
-            let view = &*socket.as_std_view()?;
-
-            util::set_tcp_keepidle(view, duration)?;
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            socket.keep_alive_idle_time = Some(duration);
-        }
-
-        Ok(())
+        Ok(socket.inner.set_keep_alive_idle_time(duration)?)
     }
 
     fn keep_alive_interval(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<u64> {
         let table = self.table();
         let socket = table.get(&this)?;
-        let view = &*socket.as_std_view()?;
-        Ok(sockopt::get_tcp_keepintvl(view)?.as_nanos() as u64)
+        let duration = socket.inner.keep_alive_interval()?;
+        Ok(duration.as_nanos() as u64)
     }
 
     fn set_keep_alive_interval(
@@ -518,16 +368,15 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
         value: u64,
     ) -> SocketResult<()> {
         let table = self.table();
-        let socket = table.get(&this)?;
-        let view = &*socket.as_std_view()?;
-        Ok(util::set_tcp_keepintvl(view, Duration::from_nanos(value))?)
+        let socket = table.get_mut(&this)?;
+        let duration = Duration::from_nanos(value);
+        Ok(socket.inner.set_keep_alive_interval(duration)?)
     }
 
     fn keep_alive_count(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<u32> {
         let table = self.table();
         let socket = table.get(&this)?;
-        let view = &*socket.as_std_view()?;
-        Ok(sockopt::get_tcp_keepcnt(view)?)
+        Ok(socket.inner.keep_alive_count()?)
     }
 
     fn set_keep_alive_count(
@@ -536,51 +385,26 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
         value: u32,
     ) -> SocketResult<()> {
         let table = self.table();
-        let socket = table.get(&this)?;
-        let view = &*socket.as_std_view()?;
-        Ok(util::set_tcp_keepcnt(view, value)?)
+        let socket = table.get_mut(&this)?;
+        Ok(socket.inner.set_keep_alive_count(value)?)
     }
 
     fn hop_limit(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<u8> {
         let table = self.table();
         let socket = table.get(&this)?;
-        let view = &*socket.as_std_view()?;
-
-        let ttl = match socket.family {
-            SocketAddressFamily::Ipv4 => util::get_ip_ttl(view)?,
-            SocketAddressFamily::Ipv6 => util::get_ipv6_unicast_hops(view)?,
-        };
-
-        Ok(ttl)
+        Ok(socket.inner.hop_limit()?)
     }
 
     fn set_hop_limit(&mut self, this: Resource<tcp::TcpSocket>, value: u8) -> SocketResult<()> {
         let table = self.table();
         let socket = table.get_mut(&this)?;
-        {
-            let view = &*socket.as_std_view()?;
-
-            match socket.family {
-                SocketAddressFamily::Ipv4 => util::set_ip_ttl(view, value)?,
-                SocketAddressFamily::Ipv6 => util::set_ipv6_unicast_hops(view, value)?,
-            }
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            socket.hop_limit = Some(value);
-        }
-
-        Ok(())
+        Ok(socket.inner.set_hop_limit(value)?)
     }
 
     fn receive_buffer_size(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<u64> {
         let table = self.table();
         let socket = table.get(&this)?;
-        let view = &*socket.as_std_view()?;
-
-        let value = util::get_socket_recv_buffer_size(view)?;
-        Ok(value as u64)
+        Ok(socket.inner.receive_buffer_size()?.try_into().unwrap())
     }
 
     fn set_receive_buffer_size(
@@ -591,27 +415,13 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
         let table = self.table();
         let socket = table.get_mut(&this)?;
         let value = value.try_into().unwrap_or(usize::MAX);
-        {
-            let view = &*socket.as_std_view()?;
-
-            util::set_socket_recv_buffer_size(view, value)?;
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            socket.receive_buffer_size = Some(value);
-        }
-
-        Ok(())
+        Ok(socket.inner.set_receive_buffer_size(value)?)
     }
 
     fn send_buffer_size(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<u64> {
         let table = self.table();
         let socket = table.get(&this)?;
-        let view = &*socket.as_std_view()?;
-
-        let value = util::get_socket_send_buffer_size(view)?;
-        Ok(value as u64)
+        Ok(socket.inner.send_buffer_size()?.try_into().unwrap())
     }
 
     fn set_send_buffer_size(
@@ -622,18 +432,7 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
         let table = self.table();
         let socket = table.get_mut(&this)?;
         let value = value.try_into().unwrap_or(usize::MAX);
-        {
-            let view = &*socket.as_std_view()?;
-
-            util::set_socket_send_buffer_size(view, value)?;
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            socket.send_buffer_size = Some(value);
-        }
-
-        Ok(())
+        Ok(socket.inner.set_send_buffer_size(value)?)
     }
 
     fn subscribe(&mut self, this: Resource<tcp::TcpSocket>) -> anyhow::Result<Resource<Pollable>> {
@@ -646,22 +445,19 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
         shutdown_type: ShutdownType,
     ) -> SocketResult<()> {
         let table = self.table();
-        let socket = table.get(&this)?;
+        let socket = table.get_mut(&this)?;
 
-        let stream = match &socket.tcp_state {
-            TcpState::Connected(stream) => stream,
+        match socket.tcp_state {
+            TcpState::Connected => {}
+            TcpState::Connecting { .. } => return Err(ErrorCode::ConcurrencyConflict.into()),
             _ => return Err(ErrorCode::InvalidState.into()),
-        };
+        }
 
-        let how = match shutdown_type {
+        socket.inner.shutdown(match shutdown_type {
             ShutdownType::Receive => std::net::Shutdown::Read,
             ShutdownType::Send => std::net::Shutdown::Write,
             ShutdownType::Both => std::net::Shutdown::Both,
-        };
-
-        stream
-            .as_socketlike_view::<std::net::TcpStream>()
-            .shutdown(how)?;
+        })?;
         Ok(())
     }
 
@@ -674,5 +470,28 @@ impl<T: WasiView> crate::host::tcp::tcp::HostTcpSocket for T {
         drop(dropped);
 
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Subscribe for TcpSocketResource {
+    async fn ready(&mut self) {
+        match &mut self.tcp_state {
+            TcpState::Default
+            | TcpState::BindStarted
+            | TcpState::Bound
+            | TcpState::ListenStarted
+            | TcpState::Connected => {
+                // No async operation in progress.
+            }
+            TcpState::Connecting { future } => future.ready().await,
+            TcpState::Listening { pending_result } => match pending_result {
+                Some(_) => {}
+                None => {
+                    let result = futures::future::poll_fn(|cx| self.inner.poll_accept(cx)).await;
+                    *pending_result = Some(result);
+                }
+            },
+        }
     }
 }

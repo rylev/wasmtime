@@ -165,7 +165,7 @@ pub fn with_ambient_tokio_runtime<R>(f: impl FnOnce() -> R) -> R {
 /// later if it's to wake up a task.
 pub fn poll_noop<F>(future: Pin<&mut F>) -> Option<F::Output>
 where
-    F: Future,
+    F: Future + ?Sized,
 {
     let mut task = Context::from_waker(futures::task::noop_waker_ref());
     match future.poll(&mut task) {

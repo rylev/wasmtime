@@ -186,7 +186,7 @@ mod async_io {
             // so that way we get to use nice typed helper methods with
             // `ResourceTable`.
             "wasi:sockets/network/network": crate::network::Network,
-            "wasi:sockets/tcp/tcp-socket": crate::tcp::TcpSocket,
+            "wasi:sockets/tcp/tcp-socket": crate::host::tcp::TcpSocketResource,
             "wasi:sockets/udp/udp-socket": crate::udp::UdpSocket,
             "wasi:sockets/udp/incoming-datagram-stream": crate::udp::IncomingDatagramStream,
             "wasi:sockets/udp/outgoing-datagram-stream": crate::udp::OutgoingDatagramStream,

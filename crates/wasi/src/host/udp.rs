@@ -1,5 +1,5 @@
 use crate::host::network::util;
-use crate::network::{SocketAddrUse, SocketAddressFamily};
+use crate::network::{SocketAddrFamily, SocketAddrUse};
 use crate::{
     bindings::{
         sockets::network::{ErrorCode, IpAddressFamily, IpSocketAddress, Network},
@@ -209,8 +209,8 @@ impl<T: WasiView> udp::HostUdpSocket for T {
         let socket = table.get(&this)?;
 
         match socket.family {
-            SocketAddressFamily::Ipv4 => Ok(IpAddressFamily::Ipv4),
-            SocketAddressFamily::Ipv6 => Ok(IpAddressFamily::Ipv6),
+            SocketAddrFamily::V4 => Ok(IpAddressFamily::Ipv4),
+            SocketAddrFamily::V6 => Ok(IpAddressFamily::Ipv6),
         }
     }
 
@@ -219,8 +219,8 @@ impl<T: WasiView> udp::HostUdpSocket for T {
         let socket = table.get(&this)?;
 
         let ttl = match socket.family {
-            SocketAddressFamily::Ipv4 => util::get_ip_ttl(socket.udp_socket())?,
-            SocketAddressFamily::Ipv6 => util::get_ipv6_unicast_hops(socket.udp_socket())?,
+            SocketAddrFamily::V4 => util::get_ip_ttl(socket.udp_socket())?,
+            SocketAddrFamily::V6 => util::get_ipv6_unicast_hops(socket.udp_socket())?,
         };
 
         Ok(ttl)
@@ -235,8 +235,8 @@ impl<T: WasiView> udp::HostUdpSocket for T {
         let socket = table.get(&this)?;
 
         match socket.family {
-            SocketAddressFamily::Ipv4 => util::set_ip_ttl(socket.udp_socket(), value)?,
-            SocketAddressFamily::Ipv6 => util::set_ipv6_unicast_hops(socket.udp_socket(), value)?,
+            SocketAddrFamily::V4 => util::set_ip_ttl(socket.udp_socket(), value)?,
+            SocketAddrFamily::V6 => util::set_ipv6_unicast_hops(socket.udp_socket(), value)?,
         }
 
         Ok(())
